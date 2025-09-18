@@ -17,6 +17,7 @@ const billingWebhookRoutes = require('./routes/billingWebhook'); // <-- Add this
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1); // Trust first proxy for secure cookies on Render
 
 // CORS configuration
 const allowedOrigins = [
@@ -51,7 +52,9 @@ app.use(session({
     mongoUrl: process.env.MONGODB_URI
   }),
   cookie: {
-    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',                  // required for SameSite=None
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
     maxAge: 24 * 60 * 60 * 1000
   }
 }));
@@ -63,7 +66,7 @@ app.use(passport.session());
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:5000/api/auth/google/callback"
+  callbackURL: process.env.GOOGLE_CALLBACK_URL
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     let user = await User.findOne({ googleId: profile.id });
@@ -141,10 +144,16 @@ app.get('/api/auth/google/callback',
   },
   passport.authenticate('google', { failureRedirect: '/login' }),
   (req, res) => {
-    console.log('✅ Google OAuth successful, redirecting to frontend...');
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    res.redirect(`${frontendUrl}?login=success`);
-  }
+      console.log('✅ Google OAuth successful, redirecting to frontend...');
+      const frontendUrl = process.env.FRONTEND_URL;
+      if (!frontendUrl) {
+        console.error('❌ FRONTEND_URL env var is missing. Set it in Render.');
+        return res.status(500).send('Server misconfigured: FRONTEND_URL not set');
+      }
+      const target = `${frontendUrl}?login=success`;
+      console.log('[OAUTH] redirecting user to:', target);
+      return res.redirect(target);
+    }
 );
 
 app.post('/api/logout', (req, res) => {
