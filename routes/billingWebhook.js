@@ -33,6 +33,12 @@ function getUtcMonthRange(now = new Date()) {
   const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0));
   return { start, end };
 }
+function normalizePlanLabel(plan) {
+  const p = String(plan || '').toLowerCase();
+  if (['starter','pro','pro_plus'].includes(p)) return p;
+  if (p === 'premium') return 'starter';
+  return 'starter';
+}
 
 // Use a raw body ONLY for this route to verify signature
 router.post(
@@ -98,6 +104,11 @@ router.post(
       }
 
       const userId = orderInfo?.notes?.userId;
+      // Insert: extract plan/billingCycle from notes
+      const planRaw = orderInfo?.notes?.plan || 'starter';
+      const plan = normalizePlanLabel(planRaw);
+      const billingCycle = orderInfo?.notes?.billingCycle || 'monthly'; // reserved
+
       if (!userId) {
         console.warn('[webhook] No userId in order notes');
         return res.status(200).json({ ok: true, noUser: true });
@@ -111,36 +122,39 @@ router.post(
 
       // Activate premium for 30 days (extend if already active)
       const now = new Date();
-      const hasActivePremium =
-        (user.subscription_type === 'premium' || user.is_premium === true) &&
+      const hasActivePaid =
+        (user.subscription_type && user.subscription_type !== 'free') &&
         user.subscription_end && new Date(user.subscription_end) > now;
-
-      const base = hasActivePremium ? new Date(user.subscription_end) : now;
+      const base = hasActivePaid ? new Date(user.subscription_end) : now;
       const newEnd = plusDays(base, 30);
 
-      user.subscription_type = 'premium';
+      // Replace activation block with plan-aware activation + BOTH resets
+      // (old code setting 'premium' and clearing only downloads is removed)
+      user.subscription_type = plan; // 'starter' | 'pro' | 'pro_plus'
       user.is_premium = true;
       user.subscription_start = now;
       user.subscription_end = newEnd;
 
-      // Fresh 50: clear current-month usage
+      // Fresh counters for current UTC month
       const { start, end } = getUtcMonthRange(now);
-      const beforeCount = Array.isArray(user.downloads) ? user.downloads.length : 0;
       user.downloads = (user.downloads || []).filter(d => {
         const dt = d && d.downloadedAt ? new Date(d.downloadedAt) : null;
         return !(dt && dt >= start && dt < end);
       });
-      const afterCount = user.downloads.length;
-      const removed = beforeCount - afterCount;
-
+      user.aiQueries = (user.aiQueries || []).filter(q => {
+        const t = q && q.at ? new Date(q.at) : null;
+        return !(t && t >= start && t < end);
+      });
       await user.save();
 
+      // Updated response includes plan and usage reset period
       return res.status(200).json({
         ok: true,
         activated: true,
+        plan,
         userId: String(user._id),
         paymentId,
-        usageReset: { removed, period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() } }
+        usageReset: { period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() } }
       });
     } catch (err) {
       console.error('POST /api/billing/webhook error:', err && err.stack ? err.stack : err);

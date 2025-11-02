@@ -6,7 +6,36 @@ const License = require('../models/License');
 const UserTasteProfile = require('../models/UserTasteProfile'); // Ensure this import exists ONCE at the top
 const Song = require('../models/Song'); // minimal Song model for gating
 
-const DEV_MODE = (process.env.NODE_ENV !== 'production') && (process.env.ENABLE_DEV_ROUTES === 'true');
+const DEV_MODE = (process.env.NODE_ENV !== 'production') &&
+                 (String(process.env.ENABLE_DEV_ROUTES || '').toLowerCase() === 'true');
+
+// -------- Plan config (downloads + AI + premium gating) --------
+const PLAN_CONFIG = {
+  free:      { ai: 5,    downloads: 3,   canDownloadPaid: false },
+  starter:   { ai: 200,  downloads: 50,  canDownloadPaid: true  },
+  pro:       { ai: 500,  downloads: 150, canDownloadPaid: true  },
+  pro_plus:  { ai: 2000, downloads: 400, canDownloadPaid: true  },
+  // Back-compat: legacy 'premium' behaves like 'starter'
+  premium:   { ai: 200,  downloads: 50,  canDownloadPaid: true  }
+};
+
+function normalizePlan(user) {
+  try {
+    const raw = String(user?.subscription_type || 'free').toLowerCase();
+    if (raw === 'premium') return 'starter'; // legacy → starter behavior
+    if (raw === 'starter' || raw === 'pro' || raw === 'pro_plus' || raw === 'free') return raw;
+    if (user?.is_premium) return 'starter'; // unknown label but flagged premium → starter
+    return 'free';
+  } catch {
+    return 'free';
+  }
+}
+
+function getUtcMonthRange(now = new Date()) {
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+  return { start, end };
+}
 
 // Test route to check if routes are working
 router.get('/test-route', (req, res) => {
@@ -408,17 +437,18 @@ router.post('/track-download', async (req, res) => {
       return res.status(404).json({ error: 'SONG_NOT_FOUND' });
     }
 
-    const premiumActive = isPremiumActive(user);
-    const plan = premiumActive ? 'premium' : 'free';
-    const monthlyLimit = premiumActive ? 50 : 3;
+    // Replace old premium logic with plan-tier logic:
+    const planNormalized = normalizePlan(user); // 'free' | 'starter' | 'pro' | 'pro_plus'
+    const cfg = PLAN_CONFIG[planNormalized] || PLAN_CONFIG.free;
+    const monthlyLimit = cfg.downloads;
+    const canDownloadPaid = !!cfg.canDownloadPaid;
     const isPremiumTrack = (songDoc.collectionType === 'paid');
 
-    // Block free users from downloading paid tracks
-    if (isPremiumTrack && !premiumActive) {
-      console.log('[track-download] blocking: premium required for paid track');
+    if (isPremiumTrack && !canDownloadPaid) {
+      console.log('[track-download] blocking: paid track requires a paid plan');
       return res.status(403).json({
         error: 'PREMIUM_REQUIRED',
-        message: 'Premium is required to download this track'
+        message: 'A paid plan is required to download this track'
       });
     }
 
@@ -438,14 +468,14 @@ router.post('/track-download', async (req, res) => {
         }, 0)
       : 0;
 
-    console.log('[track-download] plan/usage:', { plan, monthlyLimit, usedThisMonth });
+    console.log('[track-download] plan/usage:', { planNormalized, monthlyLimit, usedThisMonth });
 
     if (usedThisMonth >= monthlyLimit) {
       console.log('[track-download] limit reached, blocking');
       return res.status(429).json({
         error: 'LIMIT_REACHED',
         message: 'Monthly download limit reached',
-        plan,
+        plan: planNormalized,
         monthlyLimit,
         usedThisMonth,
         remaining: 0,
@@ -458,7 +488,9 @@ router.post('/track-download', async (req, res) => {
     try {
       // Use provided title or the DB title as fallback
       const effectiveTitle = songTitle || songDoc.title || 'Unknown Title';
-      licenseInfo = await createLicenseWithRetries(user, songId, effectiveTitle, plan, 5);
+      // Ensure License.planAtIssue remains 'free' or 'premium'
+      const planForLicense = (planNormalized === 'free') ? 'free' : 'premium';
+      licenseInfo = await createLicenseWithRetries(user, songId, effectiveTitle, planForLicense, 5);
     } catch (err) {
       console.error('[track-download] issue license error:', err && err.stack ? err.stack : err);
       return res.status(500).json({
@@ -488,13 +520,18 @@ router.post('/track-download', async (req, res) => {
       return res.status(500).json({ error: 'DOWNLOAD_RECORD_FAILED' });
     }
 
+    // Final response payload (back-compat + detailed plan)
     const newUsed = usedThisMonth + 1;
     const remaining = Math.max(0, monthlyLimit - newUsed);
-    const subscriptionStatus = premiumActive ? 'Active' : 'Inactive';
+    const isPaidPlan = (planNormalized !== 'free');
+    const subscriptionStatus = isPaidPlan ? 'Active' : 'Inactive';
 
     return res.status(201).json({
       ok: true,
-      plan,
+      // Back-compat for frontend that expects 'premium'|'free':
+      plan: isPaidPlan ? 'premium' : 'free',
+      // Also expose the detailed plan label:
+      subscription_type: planNormalized,
       monthlyLimit,
       usedThisMonth: newUsed,
       remaining,
@@ -602,28 +639,44 @@ router.get('/limits', async (req, res) => {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    const premiumActive = isPremiumActive(user);
-    const plan = premiumActive ? 'premium' : 'free';
-    const monthlyLimit = premiumActive ? 50 : 3;
+    const planNormalized = normalizePlan(user);
+    const cfg = PLAN_CONFIG[planNormalized] || PLAN_CONFIG.free;
+    const dlMonthlyLimit = cfg.downloads;
+    const aiMonthlyLimit = cfg.ai;
 
     const { start, end } = getUtcMonthRange();
-    const usedThisMonth = Array.isArray(user.downloads)
+    const dlUsedThisMonth = Array.isArray(user.downloads)
       ? user.downloads.reduce((acc, d) => {
           const dt = d && d.downloadedAt ? new Date(d.downloadedAt) : null;
           return (dt && dt >= start && dt < end) ? acc + 1 : acc;
         }, 0)
       : 0;
+    const dlRemaining = Math.max(0, dlMonthlyLimit - dlUsedThisMonth);
 
-    const remaining = Math.max(0, monthlyLimit - usedThisMonth);
+    const aiUsedThisMonth = Array.isArray(user.aiQueries)
+      ? user.aiQueries.reduce((acc, q) => {
+          const t = q && q.at ? new Date(q.at) : null;
+          return (t && t >= start && t < end) ? acc + 1 : acc;
+        }, 0)
+      : 0;
+    const aiRemaining = Math.max(0, aiMonthlyLimit - aiUsedThisMonth);
 
     return res.json({
-      plan,
-      monthlyLimit,
-      usedThisMonth,
-      remaining,
-      period: {
-        startUtcIso: start.toISOString(),
-        endUtcIso: end.toISOString()
+      // Back-compat field (premium/free only):
+      plan: (planNormalized === 'free') ? 'free' : 'premium',
+      // Also expose detailed plan:
+      subscription_type: planNormalized,
+      // Downloads (back-compat fields preserved)
+      monthlyLimit: dlMonthlyLimit,
+      usedThisMonth: dlUsedThisMonth,
+      remaining: dlRemaining,
+      period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() },
+      // New: AI limits
+      ai: {
+        monthlyLimit: aiMonthlyLimit,
+        usedThisMonth: aiUsedThisMonth,
+        remaining: aiRemaining,
+        period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() }
       }
     });
   } catch (err) {
@@ -686,6 +739,43 @@ router.post('/dev/reset-month-usage', async (req, res) => {
     });
   } catch (err) {
     console.error('POST /api/user/dev/reset-month-usage error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DEV-ONLY: Reset current month AI usage for the logged-in user
+router.post('/dev/reset-ai-usage', async (req, res) => {
+  if (!DEV_MODE) return res.status(404).json({ error: 'Not found' });
+  try {
+    const token =
+      req.headers['x-admin-token'] ||
+      (req.get && (req.get('X-Admin-Token') || req.get('x-admin-token'))) ||
+      req.query.token ||
+      req.query.t;
+    if (!token || token !== process.env.DEV_ADMIN_TOKEN) {
+      return res.status(403).json({ error: 'FORBIDDEN', message: 'Missing or invalid admin token' });
+    }
+    if (typeof req.isAuthenticated === 'function' && !req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const candidate = req.user || (req.session && (req.session.user || (req.session.passport && req.session.passport.user)));
+    const userId = typeof candidate === 'string' ? candidate : (candidate && (candidate._id || candidate.id));
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const { start, end } = getUtcMonthRange();
+    const before = Array.isArray(user.aiQueries) ? user.aiQueries.length : 0;
+    user.aiQueries = Array.isArray(user.aiQueries)
+      ? user.aiQueries.filter(q => {
+          const t = q && q.at ? new Date(q.at) : null;
+          return !(t && t >= start && t < end);
+        })
+      : [];
+    await user.save();
+    const after = user.aiQueries.length;
+    return res.json({ ok: true, removed: before - after, period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() } });
+  } catch (err) {
+    console.error('POST /api/user/dev/reset-ai-usage error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -762,19 +852,24 @@ router.post('/dev/set-plan', async (req, res) => {
       return res.status(401).json({ error: 'Not authenticated' });
     }
 
+    // Accept plan from body OR query (?plan=)
     const planRaw = (req.body && req.body.plan) || req.query.plan;
-    const plan = String(planRaw || '').toLowerCase().trim();
-
-    if (!['free', 'premium'].includes(plan)) {
-      return res.status(400).json({ error: 'INVALID_PLAN', message: "plan must be 'free' or 'premium'" });
+    const plan = planRaw ? String(planRaw).toLowerCase().trim() : '';
+    if (!['free', 'premium', 'starter', 'pro', 'pro_plus'].includes(plan)) {
+      return res.status(400).json({
+        error: 'INVALID_PLAN',
+        message: "plan must be one of: free, premium, starter, pro, pro_plus"
+      });
     }
 
+    // Load user doc (this was missing and caused 500)
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    user.subscription_type = plan;
-    user.is_premium = (plan === 'premium');
-
+    // Map legacy 'premium' → behave like 'starter'
+    const normalized = (plan === 'premium') ? 'starter' : plan;
+    user.subscription_type = normalized;
+    user.is_premium = (normalized !== 'free');
     await user.save();
 
     return res.json({

@@ -21,6 +21,7 @@
     "express-session": "^1.18.2",
     "mongoose": "^8.17.0",
     "node-cron": "^3.0.3",
+    "openai": "^4.104.0",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
     "razorpay": "^2.9.6"

@@ -41,7 +41,7 @@ const userSchema = new mongoose.Schema({
   },
   subscription_type: {
     type: String,
-    enum: ['free', 'premium'],
+    enum: ['free', 'starter', 'pro', 'pro_plus', 'premium'],
     default: 'free'
   },
   subscription_start: {
@@ -65,6 +65,10 @@ const userSchema = new mongoose.Schema({
       type: Date,
       default: Date.now
     }
+  }],
+  aiQueries: [{
+    at: { type: Date, default: Date.now },
+    topK: { type: Number } // optional
   }],
   createdAt: {
     type: Date,

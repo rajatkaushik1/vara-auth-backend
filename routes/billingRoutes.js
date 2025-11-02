@@ -52,6 +52,49 @@ function getUtcMonthRange(now = new Date()) {
   return { start, end };
 }
 
+// ---------- Plan pricing (paise) ----------
+// Defaults reflect your UI copy; can be overridden via env variables if needed.
+const PLAN_PRICE_PAISE = {
+  starter: {
+    monthly: Number(process.env.RZP_STARTER_MONTHLY_PAISE || 5900),   // ₹59
+    annual:  Number(process.env.RZP_STARTER_ANNUAL_PAISE  || (39 * 100 * 12)) // ₹39 x 12 = ₹468
+  },
+  pro: {
+    monthly: Number(process.env.RZP_PRO_MONTHLY_PAISE     || 9900),   // ₹99
+    annual:  Number(process.env.RZP_PRO_ANNUAL_PAISE      || (79 * 100 * 12)) // ₹79 x 12 = ₹948
+  },
+  pro_plus: {
+    monthly: Number(process.env.RZP_PRO_PLUS_MONTHLY_PAISE|| 19900),  // ₹199
+    annual:  Number(process.env.RZP_PRO_PLUS_ANNUAL_PAISE || (179 * 100 * 12)) // ₹179 x 12 = ₹2148
+  }
+};
+function getPlanPricePaise(plan = 'starter', billingCycle = 'monthly') {
+  const p = String(plan || 'starter').toLowerCase();
+  const c = (billingCycle === 'annual') ? 'annual' : 'monthly';
+  const table = PLAN_PRICE_PAISE[p] || PLAN_PRICE_PAISE.starter;
+  return Number(table[c] || PLAN_PRICE_PAISE.starter.monthly);
+}
+function normalizePlanLabel(plan) {
+  const p = String(plan || '').toLowerCase();
+  if (['starter','pro','pro_plus'].includes(p)) return p;
+  if (p === 'premium') return 'starter'; // legacy mapping
+  return 'starter';
+}
+function resetCurrentMonthUsage(user, now = new Date()) {
+  const { start, end } = getUtcMonthRange(now);
+  // Reset downloads in current UTC month
+  user.downloads = (user.downloads || []).filter(d => {
+    const dt = d && d.downloadedAt ? new Date(d.downloadedAt) : null;
+    return !(dt && dt >= start && dt < end);
+  });
+  // Reset AI usage in current UTC month
+  user.aiQueries = (user.aiQueries || []).filter(q => {
+    const t = q && q.at ? new Date(q.at) : null;
+    return !(t && t >= start && t < end);
+  });
+  return { start, end };
+}
+
 // DEV: quick env check (protected)
 router.get('/dev/env-check', (req, res) => {
   if (!DEV_MODE) return res.status(404).json({ error: 'Not found' });
@@ -88,12 +131,16 @@ router.get('/config', (req, res) => {
   const keyId = (process.env.RAZORPAY_KEY_ID || '').trim();
   const keySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
   const hasRazorpay = Boolean(keyId && keySecret);
-  const amountPaise = Number(process.env.RAZORPAY_PREMIUM_PRICE_PAISE || 5900);
   return res.json({
     ok: true,
     hasRazorpay,
-    amount: amountPaise,
-    currency: 'INR'
+    currency: 'INR',
+    // default amounts so frontend can show a preview if needed
+    prices: {
+      starter: { monthly: PLAN_PRICE_PAISE.starter.monthly, annual: PLAN_PRICE_PAISE.starter.annual },
+      pro:     { monthly: PLAN_PRICE_PAISE.pro.monthly,     annual: PLAN_PRICE_PAISE.pro.annual },
+      pro_plus:{ monthly: PLAN_PRICE_PAISE.pro_plus.monthly,annual: PLAN_PRICE_PAISE.pro_plus.annual }
+    }
   });
 });
 
@@ -136,9 +183,13 @@ router.post('/create-order', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const rzp = getRazorpayInstance();
-    const amountPaise = Number(process.env.RAZORPAY_PREMIUM_PRICE_PAISE || 5900); // ₹59
-    const currency = 'INR';
 
+    // Replace amount/notes with plan-aware values
+    const planRaw = (req.body && req.body.plan) || req.query.plan || 'starter';
+    const billingCycle = (req.body && req.body.billingCycle) || req.query.billingCycle || 'monthly';
+    const plan = normalizePlanLabel(planRaw);
+    const amountPaise = getPlanPricePaise(plan, billingCycle);
+    const currency = 'INR';
     const order = await rzp.orders.create({
       amount: amountPaise,
       currency,
@@ -146,7 +197,9 @@ router.post('/create-order', async (req, res) => {
       payment_capture: 1,
       notes: {
         userId: String(user._id),
-        userEmail: user.email || ''
+        userEmail: user.email || '',
+        plan,
+        billingCycle
       }
     });
 
@@ -155,7 +208,9 @@ router.post('/create-order', async (req, res) => {
       keyId: process.env.RAZORPAY_KEY_ID,
       orderId: order.id,
       amount: order.amount,
-      currency: order.currency
+      currency: order.currency,
+      plan,
+      billingCycle
     });
   } catch (err) {
     const debug = extractRazorpayError(err);
@@ -197,44 +252,44 @@ router.post('/verify', async (req, res) => {
       return res.status(400).json({ error: 'INVALID_SIGNATURE', message: 'Signature verification failed' });
     }
 
-    const user = await User.findById(auth.userId);
+    // Extract userId from notes (set by create-order)
+    const authNotes = req.body.notes || {};
+    const userId = authNotes.userId || auth.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+    // Determine plan from client (fallback to 'starter' if not provided)
+    const planRaw = (req.body && req.body.plan) || req.query.plan || 'starter';
+    const plan = normalizePlanLabel(planRaw);
+
+    const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const now = new Date();
-    const hasActivePremium =
-      (user.subscription_type === 'premium' || user.is_premium === true) &&
-      user.subscription_end &&
-      new Date(user.subscription_end) > now;
-
-    const base = hasActivePremium ? new Date(user.subscription_end) : now;
+    const hasActivePaid =
+      (user.subscription_type && user.subscription_type !== 'free') &&
+      user.subscription_end && new Date(user.subscription_end) > now;
+    const base = hasActivePaid ? new Date(user.subscription_end) : now;
     const newEnd = plusDays(base, 30);
 
-    // Activate premium (30-day pass)
-    user.subscription_type = 'premium';
+    // Activate selected plan for 30 days
+    user.subscription_type = plan;        // 'starter' | 'pro' | 'pro_plus'
     user.is_premium = true;
     user.subscription_start = now;
     user.subscription_end = newEnd;
 
-    // Fresh 50: clear current UTC month usage BEFORE saving
-    const { start, end } = getUtcMonthRange(now);
-    const beforeCount = Array.isArray(user.downloads) ? user.downloads.length : 0;
-    user.downloads = (user.downloads || []).filter(d => {
-      const dt = d && d.downloadedAt ? new Date(d.downloadedAt) : null;
-      return !(dt && dt >= start && dt < end);
-    });
-    const afterCount = user.downloads.length;
-    const removed = beforeCount - afterCount;
-
+    // Fresh counters: reset downloads + AI for current UTC month
+    const { start, end } = resetCurrentMonthUsage(user, now);
     await user.save();
 
+    // Return plan-appropriate monthlyLimit for downloads for convenience
+    const monthlyLimit = (plan === 'pro') ? 150 : (plan === 'pro_plus') ? 400 : 50;
     return res.json({
       ok: true,
-      message: 'Premium activated with fresh 50 this month',
-      plan: 'premium',
+      message: `Plan '${plan}' activated with fresh counters`,
+      plan, // detailed plan label
       premium_expires_at: user.subscription_end,
-      monthlyLimit: 50,
+      monthlyLimit,
       usageReset: {
-        removed,
         period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() }
       }
     });
@@ -267,42 +322,32 @@ router.post('/dev/simulate-purchase', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const now = new Date();
-    const hasActivePremium =
-      (user.subscription_type === 'premium' || user.is_premium === true) &&
-      user.subscription_end &&
-      new Date(user.subscription_end) > now;
-
-    const base = hasActivePremium ? new Date(user.subscription_end) : now;
+    const hasActivePaid =
+      (user.subscription_type && user.subscription_type !== 'free') &&
+      user.subscription_end && new Date(user.subscription_end) > now;
+    const base = hasActivePaid ? new Date(user.subscription_end) : now;
     const newEnd = plusDays(base, 30);
 
-    user.subscription_type = 'premium';
+    const planRaw = (req.body && req.body.plan) || req.query.plan || 'starter';
+    const plan = normalizePlanLabel(planRaw);
+
+    user.subscription_type = plan; // 'starter' | 'pro' | 'pro_plus'
     user.is_premium = true;
     user.subscription_start = now;
     user.subscription_end = newEnd;
 
-    // Fresh 50: clear current UTC month usage BEFORE saving
-    const { start, end } = getUtcMonthRange(now);
-    const beforeCount = Array.isArray(user.downloads) ? user.downloads.length : 0;
-    user.downloads = (user.downloads || []).filter(d => {
-      const dt = d && d.downloadedAt ? new Date(d.downloadedAt) : null;
-      return !(dt && dt >= start && dt < end);
-    });
-    const afterCount = user.downloads.length;
-    const removed = beforeCount - afterCount;
-
+    const { start, end } = resetCurrentMonthUsage(user, now);
     await user.save();
 
+    const monthlyLimit = (plan === 'pro') ? 150 : (plan === 'pro_plus') ? 400 : 50;
     return res.json({
       ok: true,
-      message: 'Premium activated (DEV simulate) with fresh 50 this month',
-      plan: 'premium',
+      message: `Plan '${plan}' activated (DEV simulate) with fresh counters`,
+      plan,
       premium_expires_at: user.subscription_end,
-      monthlyLimit: 50,
+      monthlyLimit,
       dev: true,
-      usageReset: {
-        removed,
-        period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() }
-      }
+      usageReset: { period: { startUtcIso: start.toISOString(), endUtcIso: end.toISOString() } }
     });
   } catch (err) {
     console.error('POST /api/billing/dev/simulate-purchase error:', err && err.stack ? err.stack : err);
