@@ -134,24 +134,37 @@ app.get('/api/auth/google', (req, res, next) => {
   })(req, res, next);
 });
 
-app.get('/api/auth/google/callback', 
+app.get('/api/auth/google/callback',
   (req, res, next) => {
+    // This middleware will now dynamically set the failure redirect
     console.log('🔄 Processing Google OAuth callback...');
     console.log('Query params:', req.query);
-    next();
+
+    // Get the frontend URL from your Render environment variables
+    const frontendUrl = process.env.FRONTEND_URL;
+    
+    // Define the URL to send users to if they cancel (e.g., back to the login page)
+    // We'll use your live site as a fallback in case the env var is missing
+    const safeFrontendUrl = frontendUrl || 'https://varamusic.com';
+    const failureRedirectUrl = `${safeFrontendUrl}/login?error=cancelled`;
+
+    // Now, call passport.authenticate with the dynamic failure URL
+    passport.authenticate('google', { 
+      failureRedirect: failureRedirectUrl 
+    })(req, res, next);
   },
-  passport.authenticate('google', { failureRedirect: '/login' }),
+  // This next function will ONLY be called if authentication succeeds
   (req, res) => {
-      console.log('✅ Google OAuth successful, redirecting to frontend...');
-      const frontendUrl = process.env.FRONTEND_URL;
-      if (!frontendUrl) {
-        console.error('❌ FRONTEND_URL env var is missing. Set it in Render.');
-        return res.status(500).send('Server misconfigured: FRONTEND_URL not set');
-      }
-      const target = `${frontendUrl}?login=success`;
-      console.log('[OAUTH] redirecting user to:', target);
-      return res.redirect(target);
+    console.log('✅ Google OAuth successful, redirecting to frontend...');
+    const frontendUrl = process.env.FRONTEND_URL;
+    if (!frontendUrl) {
+      console.error('❌ FRONTEND_URL env var is missing. Set it in Render.');
+      return res.status(500).send('Server misconfigured: FRONTEND_URL not set');
     }
+    const target = `${frontendUrl}?login=success`;
+    console.log('[OAUTH] redirecting user to:', target);
+    return res.redirect(target);
+  }
 );
 
 app.post('/api/logout', (req, res) => {
