@@ -28,18 +28,14 @@ const allowedOrigins = [
   'https://vara-user-frontend.onrender.com',
   'https://vara-admin-frontend.onrender.com'
 ];
-
 app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin) ||
-        (origin && (origin.includes('localhost') || origin.includes('render.com')))) {
-      return callback(null, true);
-    }
-    return callback(null, true);
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Origin', 'Accept']
+  origin: [
+    'http://localhost:5173',               // For local dev
+    'http://localhost:3000',               // For local dev
+    'https://vara-user-frontend.pages.dev', // For Cloudflare previews
+    'https://varamusic.com'                // For your live production site
+  ],
+  credentials: true
 }));
 app.options('*', cors());
 app.use('/api/billing/webhook', billingWebhookRoutes); // <-- Mount webhook BEFORE express.json
