@@ -99,8 +99,20 @@ function buildMaps() {
 
 async function refreshTaxonomyIfStale() {
   try {
+    const TTL_MS = 60000;
+    const now = Date.now();
+    const isEmpty =
+      !Array.isArray(taxonomy.genres) || taxonomy.genres.length === 0 ||
+      !Array.isArray(taxonomy.subGenres) || taxonomy.subGenres.length === 0 ||
+      !Array.isArray(taxonomy.moods) || taxonomy.moods.length === 0 ||
+      !Array.isArray(taxonomy.instruments) || taxonomy.instruments.length === 0;
+
+    if (!isEmpty && taxonomy.v && taxonomy.lastLoadedAt && (now - taxonomy.lastLoadedAt) < TTL_MS) {
+      return; // fresh enough; skip version check
+    }
+
     const ver = await getJson(`${ADMIN_BASE}/api/content/version`);
-    if (!taxonomy.v || taxonomy.v !== ver.v) {
+    if (!taxonomy.v || taxonomy.v !== ver.v || isEmpty) {
       const [genres, subGenres, moods, instruments] = await Promise.all([
         getJson(`${ADMIN_BASE}/api/genres`),
         getJson(`${ADMIN_BASE}/api/subgenres`),
@@ -120,6 +132,9 @@ async function refreshTaxonomyIfStale() {
         instruments: taxonomy.instruments.length,
         v: taxonomy.v
       });
+    } else {
+      // Version unchanged but TTL passed: bump lastLoadedAt to avoid immediate recheck
+      taxonomy.lastLoadedAt = now;
     }
   } catch (err) {
     console.warn('[AI] Taxonomy refresh failed (continuing with current cache):', err?.message || err);
@@ -636,10 +651,7 @@ async function collectCandidates(spec) {
     .filter(Boolean)
     .map(i => String(i._id));
 
-  // Pass 1: exact sub-genres
-  if (subGenreIds.length) add(await getSongsByGenres({ subGenreIds, limit: 120 }));
-
-  // Pass 2: sibling sub-genres (same parent)
+  // Sibling sub-genres (compute only; no awaits inside)
   const siblingSubIds = [];
   if (subGenreIds.length) {
     const parentId = taxonomy.parentBySubId.get(subGenreIds[0]);
@@ -650,19 +662,34 @@ async function collectCandidates(spec) {
           siblingSubIds.push(String(sg._id));
         }
       });
-      if (siblingSubIds.length) add(await getSongsByGenres({ subGenreIds: siblingSubIds, limit: 100 }));
     }
   }
 
-  // Pass 3: parent genre
-  if (genreId) add(await getSongsByGenres({ genreIds: [genreId], limit: 120 }));
+  // Build parallel Admin requests with slightly reduced limits
+  const promises = [];
+  if (subGenreIds.length) {
+    promises.push(getSongsByGenres({ subGenreIds, limit: 80 }));
+  }
+  if (siblingSubIds.length) {
+    promises.push(getSongsByGenres({ subGenreIds: siblingSubIds, limit: 60 }));
+  }
+  if (genreId) {
+    promises.push(getSongsByGenres({ genreIds: [genreId], limit: 80 }));
+  }
+  if (moodIds.length) {
+    promises.push(getSongsByMoods(moodIds, 80));
+  }
+  if (instrumentIds.length) {
+    promises.push(getSongsByInstruments(instrumentIds, 80));
+  }
 
-  // Pass 4: moods and instruments
-  if (moodIds.length) add(await getSongsByMoods(moodIds, 100));
-  if (instrumentIds.length) add(await getSongsByInstruments(instrumentIds, 100));
+  if (promises.length > 0) {
+    const resultsArrays = await Promise.all(promises);
+    resultsArrays.forEach(arr => add(arr));
+  }
 
-  // Fallback: trending
-  if (unique.size < 50) add(await getTrending(50));
+  // Fallback: trending (slightly reduced limit)
+  if (unique.size < 40) add(await getTrending(40));
 
   const out = Array.from(unique.values());
   return { out, subGenreIds, siblingSubIds, genreId, moodIds, instrumentIds };
