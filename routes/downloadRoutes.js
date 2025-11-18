@@ -5,16 +5,35 @@ const Song = require('../models/Song'); // minimal model (strict:false), collect
 
 // Node 18+ has global fetch. If you use older Node locally, install node-fetch and require it.
 
-function sanitizeFilename(name) {
-  // Very defensive: keep only safe chars; ensure it ends with .mp3
-  const base = String(name || 'TRACK').replace(/[^a-zA-Z0-9\-_. ]/g, '').trim() || 'TRACK';
-  return base.toUpperCase().endsWith('.MP3') ? base.toUpperCase() : `${base.toUpperCase()}.MP3`;
+function inferExtensionFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const match = u.pathname.match(/\.([a-zA-Z0-9]+)$/);
+    if (!match || !match[1]) return '.MP3';
+    const candidate = match[1].toLowerCase();
+    const allowed = ['mp3', 'wav', 'flac', 'm4a', 'ogg'];
+    if (!allowed.includes(candidate)) return '.MP3';
+    return `.${candidate.toUpperCase()}`;
+  } catch {
+    return '.MP3';
+  }
+}
+
+function sanitizeFilename(name, extFromUrl) {
+  const raw = String(name || 'TRACK');
+  const withoutExt = raw.replace(/\.[a-zA-Z0-9]+$/, '');
+  const base = withoutExt.replace(/[^a-zA-Z0-9\-_. ]/g, '').trim() || 'TRACK';
+
+  const finalExt = typeof extFromUrl === 'string' && extFromUrl.trim().length > 0
+    ? extFromUrl.toUpperCase()
+    : '.MP3';
+
+  return `${base.toUpperCase()}${finalExt}`;
 }
 
 router.get('/song/:songId', async (req, res) => {
   try {
     const { songId } = req.params;
-    const customFilename = sanitizeFilename(req.query.filename || 'TRACK-VARAMUSIC.COM.mp3');
 
     if (!mongoose.Types.ObjectId.isValid(songId)) {
       return res.status(400).json({ error: 'INVALID_SONG_ID' });
@@ -24,6 +43,10 @@ router.get('/song/:songId', async (req, res) => {
     if (!song || !song.audioUrl) {
       return res.status(404).json({ error: 'SONG_NOT_FOUND_OR_NO_AUDIO_URL' });
     }
+
+    const rawFilename = req.query.filename || 'TRACK-VARAMUSIC.COM';
+    const inferredExt = inferExtensionFromUrl(song.audioUrl);
+    const customFilename = sanitizeFilename(rawFilename, inferredExt);
 
     // Forward Range if client requests it (basic streaming)
     const headers = { Accept: 'audio/*' };
